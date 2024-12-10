@@ -1,81 +1,124 @@
-import path from 'path';
-import fs from 'fs';
-import { v4 as uuidv4 } from 'uuid';
-import redisClient from '../utils/redis';
-import dbClient from '../utils/db';
+const { v4: uuidv4 } = require('uuid');
+const fs = require('fs');
+const path = require('path');
+const mongoClient = require('mongodb').MongoClient;
+const dbClient = new mongoClient(process.env.DB_URI || 'mongodb://localhost:27017', { useUnifiedTopology: true });
+
+const FOLDER_PATH = process.env.FOLDER_PATH || '/tmp/files_manager';
 
 class FilesController {
   static async postUpload(req, res) {
-    const { name, type, data, parentId = 0, isPublic = false } = req.body;
-    const token = req.headers['x-token'];
+    try {
+      const token = req.headers['x-token'];
+      if (!token) return res.status(401).json({ error: 'Unauthorized' });
 
-    // Validate the inputs
-    if (!name) {
-      return res.status(400).json({ error: 'Missing name' });
-    }
-    if (!type || !['file', 'image', 'folder'].includes(type)) {
-      return res.status(400).json({ error: 'Missing or invalid type' });
-    }
-    if (type !== 'folder' && !data) {
-      return res.status(400).json({ error: 'Missing data' });
-    }
+      const user = await getUserByToken(token);
+      if (!user) return res.status(401).json({ error: 'Unauthorized' });
 
-    // Retrieve user from token
-    const userId = await redisClient.get(`auth_${token}`);
-    if (!userId) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
+      const { name, type, parentId = 0, isPublic = false, data } = req.body;
+      if (!name) return res.status(400).json({ error: 'Missing name' });
+      if (!['folder', 'file', 'image'].includes(type)) return res.status(400).json({ error: 'Missing type' });
+      if (type !== 'folder' && !data) return res.status(400).json({ error: 'Missing data' });
 
-    // Check if the parentId exists and is a folder (for non-folder types)
-    if (parentId !== 0) {
-      const parentFile = await dbClient.db.collection('files').findOne({ _id: parentId });
-      if (!parentFile) {
-        return res.status(400).json({ error: 'Parent not found' });
+      const db = dbClient.db('files_manager');
+      const parentFile = parentId ? await db.collection('files').findOne({ _id: parentId }) : null;
+
+      if (parentId && !parentFile) return res.status(400).json({ error: 'Parent not found' });
+      if (parentFile && parentFile.type !== 'folder') return res.status(400).json({ error: 'Parent is not a folder' });
+
+      const fileDoc = { userId: user._id, name, type, isPublic, parentId };
+      if (type !== 'folder') {
+        const localPath = path.join(FOLDER_PATH, uuidv4());
+        fileDoc.localPath = localPath;
+        fs.writeFileSync(localPath, Buffer.from(data, 'base64'));
       }
-      if (parentFile.type !== 'folder') {
-        return res.status(400).json({ error: 'Parent is not a folder' });
-      }
+
+      const result = await db.collection('files').insertOne(fileDoc);
+      res.status(201).json({ id: result.insertedId, ...fileDoc });
+    } catch (err) {
+      res.status(500).json({ error: 'Internal server error' });
     }
+  }
 
-    // Set the storage path
-    const folderPath = process.env.FOLDER_PATH || '/tmp/files_manager';
-    if (!fs.existsSync(folderPath)) {
-      fs.mkdirSync(folderPath, { recursive: true });
+  static async getShow(req, res) {
+    try {
+      const token = req.headers['x-token'];
+      if (!token) return res.status(401).json({ error: 'Unauthorized' });
+
+      const user = await getUserByToken(token);
+      if (!user) return res.status(401).json({ error: 'Unauthorized' });
+
+      const fileId = req.params.id;
+      const db = dbClient.db('files_manager');
+      const file = await db.collection('files').findOne({ _id: fileId, userId: user._id });
+
+      if (!file) return res.status(404).json({ error: 'Not found' });
+      res.json(file);
+    } catch (err) {
+      res.status(500).json({ error: 'Internal server error' });
     }
+  }
 
-    // If the file is a file or image, generate a unique file path
-    let localPath = '';
-    if (type !== 'folder') {
-      const fileId = uuidv4();
-      localPath = path.join(folderPath, fileId);
-      const buffer = Buffer.from(data, 'base64');
-      fs.writeFileSync(localPath, buffer); // Save the file to disk
+  static async getIndex(req, res) {
+    try {
+      const token = req.headers['x-token'];
+      if (!token) return res.status(401).json({ error: 'Unauthorized' });
+
+      const user = await getUserByToken(token);
+      if (!user) return res.status(401).json({ error: 'Unauthorized' });
+
+      const { parentId = 0, page = 0 } = req.query;
+      const limit = 20;
+      const skip = page * limit;
+
+      const db = dbClient.db('files_manager');
+      const files = await db
+        .collection('files')
+        .find({ parentId, userId: user._id })
+        .skip(skip)
+        .limit(limit)
+        .toArray();
+
+      res.json(files);
+    } catch (err) {
+      res.status(500).json({ error: 'Internal server error' });
     }
+  }
 
-    // Save the file metadata in the database
-    const fileDocument = {
-      userId,
-      name,
-      type,
-      parentId,
-      isPublic,
-      localPath: localPath || null,
-    };
+  static async putPublish(req, res) {
+    await togglePublish(req, res, true);
+  }
 
-    const result = await dbClient.db.collection('files').insertOne(fileDocument);
-
-    // Return the new file with status code 201
-    return res.status(201).json({
-      id: result.insertedId,
-      userId,
-      name,
-      type,
-      isPublic,
-      parentId,
-      localPath: localPath || null,
-    });
+  static async putUnpublish(req, res) {
+    await togglePublish(req, res, false);
   }
 }
 
-export default FilesController;
+async function togglePublish(req, res, isPublic) {
+  try {
+    const token = req.headers['x-token'];
+    if (!token) return res.status(401).json({ error: 'Unauthorized' });
 
+    const user = await getUserByToken(token);
+    if (!user) return res.status(401).json({ error: 'Unauthorized' });
+
+    const fileId = req.params.id;
+    const db = dbClient.db('files_manager');
+    const file = await db.collection('files').findOne({ _id: fileId, userId: user._id });
+
+    if (!file) return res.status(404).json({ error: 'Not found' });
+
+    await db.collection('files').updateOne({ _id: fileId }, { $set: { isPublic } });
+    res.json({ id: fileId, isPublic });
+  } catch (err) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
+async function getUserByToken(token) {
+  // Mock function; replace with actual user authentication logic
+  const db = dbClient.db('files_manager');
+  return await db.collection('users').findOne({ token });
+}
+
+module.exports = FilesController;
